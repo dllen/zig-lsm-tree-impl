@@ -93,47 +93,98 @@ pub const MemTable = struct {
 
     pub fn get(self: *MemTable, key: []const u8) ?[]const u8 {
         var current = self.head;
-        var i = self.level;
-        while (i >= 0) : (i -= 1) {
+        var i: usize = self.level;
+        
+        // Use a different loop structure to avoid integer underflow
+        while (true) {
             while (current.next[i]) |next| {
                 const cmp = std.mem.order(u8, next.key, key);
                 if (cmp == .eq) return next.value;
                 if (cmp == .gt) break;
                 current = next;
             }
+            
+            if (i == 0) break;
+            i -= 1;
         }
+        
         return null;
     }
 
     pub fn put(self: *MemTable, key: []const u8, value: []const u8) !void {
+        // Allocate update array for all possible levels
         var update = try self.allocator.alloc(*SkipNode, MAX_LEVEL + 1);
         defer self.allocator.free(update);
 
-        var current = self.head;
-        var i = self.level;
-        while (i > 0) : (i -= 1) {
-            while (current.next[i]) |next| {
-                const cmp = std.mem.order(u8, next.key, key);
-                if (cmp == .gt) break;
-                current = next;
-            }
-            update[i] = current;
+        // Initialize all update entries to head
+        for (0..MAX_LEVEL + 1) |j| {
+            update[j] = self.head;
         }
 
-        const newLevel = self.randomLevel();
-        const node = try SkipNode.init(self.allocator, key, value, newLevel);
+        // Find position for insertion
+        var current = self.head;
+        var i: usize = self.level;
+        while (true) {
+            // Check if current node's next at level i has a key > our key
+            if (i < current.next.len) {
+                if (current.next[i]) |next| {
+                    const cmp = std.mem.order(u8, next.key, key);
+                    if (cmp == .eq) {
+                        // Key already exists, update value
+                        const old_node = next;
+                        const new_node = try SkipNode.init(self.allocator, key, value, old_node.level);
 
-        if (newLevel > self.level) {
-            for (self.level + 1..newLevel + 1) |l| {
-                update[l] = self.head;
+                        // Copy all next pointers
+                        for (0..old_node.next.len) |l| {
+                            if (l < new_node.next.len) {
+                                new_node.next[l] = old_node.next[l];
+                            }
+                        }
+
+                        // Update all references to the old node
+                        for (0..old_node.level + 1) |l| {
+                            if (l < update[l].next.len and update[l].next[l] == old_node) {
+                                update[l].next[l] = new_node;
+                            }
+                        }
+
+                        // Free old node
+                        old_node.deinit(self.allocator);
+                        return;
+                    }
+                    if (cmp == .lt) {
+                        current = next;
+                        continue;
+                    }
+                }
             }
+
+            // Save current node as update for level i
+            update[i] = current;
+
+            // Move to next level down
+            if (i == 0) break;
+            i -= 1;
+        }
+
+        // Generate random level for new node
+        const newLevel = self.randomLevel();
+
+        // Create new node
+        const node = try SkipNode.init(self.allocator, key, value, newLevel);
+        errdefer node.deinit(self.allocator);
+
+        // Update skip list level if necessary
+        if (newLevel > self.level) {
             self.level = newLevel;
         }
 
-        i = 0;
-        while (i <= newLevel) : (i += 1) {
-            node.next[i] = update[i].next[i];
-            update[i].next[i] = node;
+        // Insert node at each level
+        for (0..newLevel + 1) |level| {
+            if (level < node.next.len and level < update[level].next.len) {
+                node.next[level] = update[level].next[level];
+                update[level].next[level] = node;
+            }
         }
 
         self.size += 1;

@@ -75,8 +75,10 @@ pub const SSTable = struct {
         // Read value length and value
         const value_len = try reader.readInt(u32, .little);
         const value = try self.allocator.alloc(u8, value_len);
+        errdefer self.allocator.free(value);
         try reader.readNoEof(value);
 
+        // The caller is now responsible for freeing this memory
         return value;
     }
 
@@ -88,23 +90,27 @@ pub const SSTable = struct {
         var reader = self.file.reader();
 
         while (true) {
-            _ = try self.file.getPos();
+            // 尝试读取键长度，如果到达文件末尾则退出循环
             const key_len = reader.readInt(u32, .little) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
 
+            // 读取键
             const key = try self.allocator.alloc(u8, key_len);
             errdefer self.allocator.free(key);
             try reader.readNoEof(key);
 
+            // 读取值长度和值
             const value_len = try reader.readInt(u32, .little);
             const value = try self.allocator.alloc(u8, value_len);
             errdefer self.allocator.free(value);
             try reader.readNoEof(value);
 
+            // 读取时间戳
             const timestamp = try reader.readInt(i64, .little);
 
+            // 添加条目到列表
             try entries.append(Entry{
                 .key = key,
                 .value = value,
@@ -144,11 +150,14 @@ test "SSTable basic operations" {
 
     // Test reading entries
     const value1 = try sstable.get("key1");
+    defer if (value1) |v| allocator.free(v);
     try std.testing.expect(std.mem.eql(u8, value1.?, "value1"));
 
     const value2 = try sstable.get("key2");
+    defer if (value2) |v| allocator.free(v);
     try std.testing.expect(std.mem.eql(u8, value2.?, "value2"));
 
     const non_existent = try sstable.get("key3");
+    defer if (non_existent) |v| allocator.free(v);
     try std.testing.expect(non_existent == null);
 }
