@@ -1,46 +1,41 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
+const std = @import("std");
+const LSMTree = @import("zig_lsm_tree_lib").LSMTree;
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    var lsm = try LSMTree.init(allocator);
+    defer lsm.deinit();
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    std.debug.print("LSM Tree teaching example\n", .{});
+    std.debug.print("------------------------\n\n", .{});
 
-    try bw.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "use other module" {
-    try std.testing.expectEqual(@as(i32, 150), lib.add(100, 50));
-}
-
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
+    // Insert key-value pairs that are small enough to fit in one MemTable flush.
+    const pairs = [_]struct { []const u8, []const u8 }{
+        .{ "apple", "red" },
+        .{ "banana", "yellow" },
+        .{ "cherry", "red" },
+        .{ "date", "brown" },
+        .{ "elderberry", "purple" },
     };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+
+    std.debug.print("Inserting {d} key-value pairs...\n", .{pairs.len});
+    for (pairs) |pair| {
+        try lsm.put(pair[0], pair[1]);
+        std.debug.print("  put({s}, {s})\n", .{ pair[0], pair[1] });
+    }
+
+    std.debug.print("\nReading values back...\n", .{});
+    for (pairs) |pair| {
+        if (try lsm.get(pair[0])) |value| {
+            defer allocator.free(value);
+            std.debug.print("  get({s}) -> {s}\n", .{ pair[0], value });
+        } else {
+            std.debug.print("  get({s}) -> <missing>\n", .{pair[0]});
+        }
+    }
+
+    std.debug.print("\nRun `zig build test` to verify the implementation.\n", .{});
 }
-
-const std = @import("std");
-
-/// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
-const lib = @import("zig_lsm_tree_lib");

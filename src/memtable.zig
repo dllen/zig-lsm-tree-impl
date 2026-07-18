@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// SkipNode represents a node in the skip list
+/// SkipNode represents a node in the skip list.
 pub const SkipNode = struct {
     key: []const u8,
     value: []const u8,
@@ -31,10 +31,10 @@ pub const SkipNode = struct {
     }
 };
 
-/// MemTable implements an in-memory sorted key-value store using a skip list
+/// MemTable implements an in-memory sorted key-value store using a skip list.
 pub const MemTable = struct {
     const MAX_LEVEL = 16;
-    const P = 0.5; // Probability for level generation
+    const P = 0.5;
 
     allocator: Allocator,
     head: *SkipNode,
@@ -45,7 +45,7 @@ pub const MemTable = struct {
     pub fn init(allocator: Allocator) !*MemTable {
         const self = try allocator.create(MemTable);
         const head = try SkipNode.init(allocator, "", "", MAX_LEVEL);
-        const prng = std.Random.Xoshiro256.init(0); // Using static seed for initialization
+        const prng = std.Random.Xoshiro256.init(0);
         self.* = MemTable{
             .allocator = allocator,
             .head = head,
@@ -57,29 +57,16 @@ pub const MemTable = struct {
     }
 
     pub fn deinit(self: *MemTable) void {
-        // Free nodes one by one, starting from head
         var current = self.head;
-
-        // Store the next node before freeing the current one
         while (true) {
-            var next_node: ?*SkipNode = null;
-
-            // Get the next node if it exists
-            if (current.next.len > 0) {
-                next_node = current.next[0];
-            }
-
-            // Free the current node
+            const next_node = current.next[0];
             current.deinit(self.allocator);
-
-            // Move to the next node or exit if we've reached the end
             if (next_node) |next| {
                 current = next;
             } else {
                 break;
             }
         }
-
         self.allocator.destroy(self);
     }
 
@@ -94,8 +81,6 @@ pub const MemTable = struct {
     pub fn get(self: *MemTable, key: []const u8) ?[]const u8 {
         var current = self.head;
         var i: usize = self.level;
-        
-        // Use a different loop structure to avoid integer underflow
         while (true) {
             while (current.next[i]) |next| {
                 const cmp = std.mem.order(u8, next.key, key);
@@ -103,52 +88,39 @@ pub const MemTable = struct {
                 if (cmp == .gt) break;
                 current = next;
             }
-            
             if (i == 0) break;
             i -= 1;
         }
-        
         return null;
     }
 
     pub fn put(self: *MemTable, key: []const u8, value: []const u8) !void {
-        // Allocate update array for all possible levels
         var update = try self.allocator.alloc(*SkipNode, MAX_LEVEL + 1);
         defer self.allocator.free(update);
 
-        // Initialize all update entries to head
         for (0..MAX_LEVEL + 1) |j| {
             update[j] = self.head;
         }
 
-        // Find position for insertion
         var current = self.head;
         var i: usize = self.level;
         while (true) {
-            // Check if current node's next at level i has a key > our key
             if (i < current.next.len) {
                 if (current.next[i]) |next| {
                     const cmp = std.mem.order(u8, next.key, key);
                     if (cmp == .eq) {
-                        // Key already exists, update value
                         const old_node = next;
                         const new_node = try SkipNode.init(self.allocator, key, value, old_node.level);
-
-                        // Copy all next pointers
                         for (0..old_node.next.len) |l| {
                             if (l < new_node.next.len) {
                                 new_node.next[l] = old_node.next[l];
                             }
                         }
-
-                        // Update all references to the old node
-                        for (0..old_node.level + 1) |l| {
-                            if (l < update[l].next.len and update[l].next[l] == old_node) {
+                        for (0..@min(old_node.level + 1, update.len)) |l| {
+                            if (update[l].next.len > l and update[l].next[l] == old_node) {
                                 update[l].next[l] = new_node;
                             }
                         }
-
-                        // Free old node
                         old_node.deinit(self.allocator);
                         return;
                     }
@@ -159,28 +131,20 @@ pub const MemTable = struct {
                 }
             }
 
-            // Save current node as update for level i
             update[i] = current;
-
-            // Move to next level down
             if (i == 0) break;
             i -= 1;
         }
 
-        // Generate random level for new node
-        const newLevel = self.randomLevel();
-
-        // Create new node
-        const node = try SkipNode.init(self.allocator, key, value, newLevel);
+        const new_level = self.randomLevel();
+        const node = try SkipNode.init(self.allocator, key, value, new_level);
         errdefer node.deinit(self.allocator);
 
-        // Update skip list level if necessary
-        if (newLevel > self.level) {
-            self.level = newLevel;
+        if (new_level > self.level) {
+            self.level = new_level;
         }
 
-        // Insert node at each level
-        for (0..newLevel + 1) |level| {
+        for (0..new_level + 1) |level| {
             if (level < node.next.len and level < update[level].next.len) {
                 node.next[level] = update[level].next[level];
                 update[level].next[level] = node;

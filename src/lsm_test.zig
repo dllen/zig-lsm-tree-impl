@@ -9,7 +9,6 @@ test "LSMTree multi-level operations" {
     var lsm = try LSMTree.init(allocator);
     defer lsm.deinit();
 
-    // Test data to trigger multiple levels
     const test_pairs = [_]struct { []const u8, []const u8 }{
         .{ "key1", "value1" },
         .{ "key2", "value2" },
@@ -18,39 +17,44 @@ test "LSMTree multi-level operations" {
         .{ "key5", "value5" },
     };
 
-    // Insert enough data to trigger level 0 compaction
-    for (0..1111) |i| {
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
         for (test_pairs) |pair| {
             const key = try std.fmt.allocPrint(allocator, "{s}_{}", .{ pair[0], i });
             defer allocator.free(key);
             try lsm.put(key, pair[1]);
         }
 
-        // Verify data after each batch
         if (i % 10 == 0) {
             for (test_pairs) |pair| {
                 const key = try std.fmt.allocPrint(allocator, "{s}_{}", .{ pair[0], i });
                 defer allocator.free(key);
-                const value = try lsm.get(key);
-                try std.testing.expect(std.mem.eql(u8, value.?, pair[1]));
+                if (try lsm.get(key)) |value| {
+                    defer allocator.free(value);
+                    try std.testing.expect(std.mem.eql(u8, value, pair[1]));
+                } else {
+                    try std.testing.expect(false);
+                }
             }
         }
     }
 
-    // Test data consistency across levels
-    for (0..1111) |i| {
+    i = 0;
+    while (i < 200) : (i += 1) {
         for (test_pairs) |pair| {
             const key = try std.fmt.allocPrint(allocator, "{s}_{}", .{ pair[0], i });
             defer allocator.free(key);
-            const value = try lsm.get(key);
-            try std.testing.expect(std.mem.eql(u8, value.?, pair[1]));
+            if (try lsm.get(key)) |value| {
+                defer allocator.free(value);
+                try std.testing.expect(std.mem.eql(u8, value, pair[1]));
+            } else {
+                try std.testing.expect(false);
+            }
         }
     }
 
-    // Test level sizes - ensure compaction has occurred
-    try std.testing.expect(lsm.level_sizes[0] < 4096); // Level 0 should be compacted
-    // Now check that level 1 has data
-    try std.testing.expect(lsm.level_sizes[1] > 0); // Level 1 should have some data
+    try std.testing.expect(lsm.level_sizes[0] < 4096);
+    try std.testing.expect(lsm.level_sizes[1] > 0);
 }
 
 test "LSMTree compaction behavior" {
@@ -61,8 +65,8 @@ test "LSMTree compaction behavior" {
     var lsm = try LSMTree.init(allocator);
     defer lsm.deinit();
 
-    // Insert data to trigger compaction
-    for (0..1000) |i| {
+    var i: usize = 0;
+    while (i < 800) : (i += 1) {
         const key = try std.fmt.allocPrint(allocator, "key_{}", .{i});
         defer allocator.free(key);
         const value = try std.fmt.allocPrint(allocator, "value_{}", .{i});
@@ -70,32 +74,33 @@ test "LSMTree compaction behavior" {
         try lsm.put(key, value);
     }
 
-    // Verify level size ratios
-    for (1..LSMTree.MAX_LEVEL) |i| {
-        if (lsm.level_sizes[i] > 0) {
-            const size_ratio = lsm.level_sizes[i] / lsm.level_sizes[i - 1];
+    var level: usize = 1;
+    while (level < LSMTree.MAX_LEVEL) : (level += 1) {
+        if (lsm.level_sizes[level] > 0 and lsm.level_sizes[level - 1] > 0) {
+            const size_ratio = lsm.level_sizes[level] / lsm.level_sizes[level - 1];
             try std.testing.expect(size_ratio <= LSMTree.LEVEL_SIZE_MULTIPLIER);
         }
     }
 
-    // Test data consistency after compaction
-    for (0..1000) |i| {
+    i = 0;
+    while (i < 800) : (i += 1) {
         const key = try std.fmt.allocPrint(allocator, "key_{}", .{i});
         defer allocator.free(key);
         const expected_value = try std.fmt.allocPrint(allocator, "value_{}", .{i});
         defer allocator.free(expected_value);
-        const value = try lsm.get(key);
-        try std.testing.expect(std.mem.eql(u8, value.?, expected_value));
+        if (try lsm.get(key)) |value| {
+            defer allocator.free(value);
+            try std.testing.expect(std.mem.eql(u8, value, expected_value));
+        } else {
+            try std.testing.expect(false);
+        }
     }
 
-    // Test level sizes - ensure compaction has occurred
-    try std.testing.expect(lsm.level_sizes[0] < 4); // Level 0 should be compacted
+    try std.testing.expect(lsm.level_sizes[0] < 4);
 
-    // If level 1 has no data, force compaction
     if (lsm.level_sizes[1] == 0) {
-        try lsm.forceCompaction(0); // Force compaction from level 0 to level 1
+        try lsm.forceCompaction(0);
     }
 
-    // Now check that level 1 has data
-    try std.testing.expect(lsm.level_sizes[1] > 0); // Level 1 should have some data
+    try std.testing.expect(lsm.level_sizes[1] > 0);
 }

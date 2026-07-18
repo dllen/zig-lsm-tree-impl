@@ -3,11 +3,23 @@ const Allocator = std.mem.Allocator;
 const MemTable = @import("memtable.zig").MemTable;
 const SSTable = @import("sstable.zig").SSTable;
 
+/// A minimal LSM-tree teaching implementation.
+///
+/// Writes always go to the in-memory MemTable first. When the MemTable
+/// exceeds the configured size threshold, it is flushed to an immutable
+/// SSTable on disk. If the number of SSTables in a level exceeds the
+/// compaction threshold, multiple levels are merged into the next level.
 pub const LSMTree = struct {
     const Self = @This();
-    pub const MAX_MEMTABLE_SIZE = 1024 * 1024; // 1MB
-    pub const MAX_LEVEL = 7; // Maximum number of levels
-    pub const LEVEL_SIZE_MULTIPLIER = 10; // Size ratio between levels
+
+    /// Maximum number of entries stored in a single MemTable before flush.
+    pub const MAX_MEMTABLE_SIZE = 256;
+
+    /// Maximum number of levels in the LSM tree.
+    pub const MAX_LEVEL = 7;
+
+    /// Size multiplier between consecutive levels for compaction thresholds.
+    pub const LEVEL_SIZE_MULTIPLIER = 10;
 
     allocator: Allocator,
     memtable: *MemTable,
@@ -15,6 +27,7 @@ pub const LSMTree = struct {
     level_sizes: [MAX_LEVEL]usize,
     sstable_counter: usize,
 
+    /// Initialize a new LSM tree instance.
     pub fn init(allocator: Allocator) !*Self {
         const self = try allocator.create(Self);
         self.allocator = allocator;
@@ -22,13 +35,13 @@ pub const LSMTree = struct {
         self.level_sizes = [_]usize{0} ** MAX_LEVEL;
         self.sstable_counter = 0;
 
-        // Initialize level arrays
         for (0..MAX_LEVEL) |i| {
             self.levels[i] = std.ArrayList(*SSTable).init(allocator);
         }
         return self;
     }
 
+    /// Release all resources owned by the LSM tree.
     pub fn deinit(self: *Self) void {
         self.memtable.deinit();
         for (self.levels) |level| {
@@ -40,24 +53,23 @@ pub const LSMTree = struct {
         self.allocator.destroy(self);
     }
 
+    /// Look up a key.
+    ///
+    /// The returned memory is owned by the caller and must be released with
+    /// the same allocator passed to `init`.
     pub fn get(self: *Self, key: []const u8) !?[]const u8 {
-        // First check memtable
+        // First check memtable.
         if (self.memtable.get(key)) |value| {
-            return value;
+            return try self.allocator.dupe(u8, value);
         }
 
-        // Check each level from top to bottom
+        // Then check SSTables from newest to oldest within each level.
         for (self.levels) |level| {
-            // Check sstables in the level from newest to oldest
             var i: usize = level.items.len;
             while (i > 0) {
                 i -= 1;
                 if (try level.items[i].get(key)) |value| {
-                    // Make a copy that we own and can return safely
-                    const result = try self.allocator.dupe(u8, value);
-                    // Free the original value from the SSTable
-                    self.allocator.free(value);
-                    return result;
+                    return value;
                 }
             }
         }
@@ -65,15 +77,19 @@ pub const LSMTree = struct {
         return null;
     }
 
+    /// Insert or update a key-value pair.
+    ///
+    /// The LSM tree copies the provided key/value internally, so the caller
+    /// does not need to keep them alive after this call returns.
     pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
         try self.memtable.put(key, value);
 
-        // Check if memtable size exceeds threshold
         if (self.memtable.size >= MAX_MEMTABLE_SIZE) {
             try self.flushMemTable();
         }
     }
 
+    /// Flush the current MemTable to a new SSTable in level 0.
     fn flushMemTable(self: *Self) !void {
         const sstable_path = try std.fmt.allocPrint(
             self.allocator,
@@ -85,61 +101,52 @@ pub const LSMTree = struct {
         const sstable = try SSTable.create(self.allocator, sstable_path);
         errdefer sstable.deinit();
 
-        // Convert MemTable entries to SSTable entries
         var entries = std.ArrayList(SSTable.Entry).init(self.allocator);
         defer entries.deinit();
 
-        // Traverse the MemTable's skip list to extract all key-value pairs
         var current = self.memtable.head;
         while (current.next[0]) |next| {
             const timestamp = std.time.timestamp();
             try entries.append(.{
-                .key = next.key,
-                .value = next.value,
+                .key = try self.allocator.dupe(u8, next.key),
+                .value = try self.allocator.dupe(u8, next.value),
                 .timestamp = timestamp,
             });
             current = next;
         }
 
-        // Write entries to SSTable
         try sstable.write(entries.items);
-
         try self.levels[0].append(sstable);
-        // 确保 level_sizes 正确更新
-        self.level_sizes[0] += entries.items.len; // 使用实际条目数
 
-        // Create new memtable
+        self.level_sizes[0] += entries.items.len;
         self.memtable.deinit();
         self.memtable = try MemTable.init(self.allocator);
         self.sstable_counter += 1;
 
-        // Check if level 0 needs compaction
-        // 检查是否需要压缩
-        if (self.level_sizes[0] >= 4096) { // 这个阈值可能需要调整
+        // Trigger compaction when level 0 exceeds the threshold.
+        if (self.level_sizes[0] >= self.levelThreshold(0)) {
             try self.compact();
         }
     }
 
+    /// Walk the LSM tree and compact levels that exceed their thresholds.
     pub fn compact(self: *Self) !void {
         var level: usize = 0;
-        while (level < MAX_LEVEL - 1) : (level += 1) {
-            const level_threshold = std.math.pow(usize, LEVEL_SIZE_MULTIPLIER, level + 1);
-            if (self.level_sizes[level] >= level_threshold) {
-                // 合并当前级别到下一级别
-                try self.mergeLevel(level);
-                // 检查是否需要继续压缩下一级别
-                continue;
+        while (level < MAX_LEVEL - 1) {
+            const threshold = Self.levelThreshold(level);
+            if (self.level_sizes[level] < threshold) {
+                break;
             }
-            // 如果当前级别不需要压缩，则停止
-            break;
+            try self.mergeLevel(level);
+            level += 1;
         }
     }
 
+    /// Merge a level into the next level when its size exceeds the threshold.
     fn mergeLevel(self: *Self, level: usize) !void {
         const next_level = level + 1;
         if (next_level >= MAX_LEVEL) return;
 
-        // 创建新的SSTable用于合并结果
         const merged_path = try std.fmt.allocPrint(
             self.allocator,
             "L{}_merged_{}.db",
@@ -150,109 +157,103 @@ pub const LSMTree = struct {
         var merged_table = try SSTable.create(self.allocator, merged_path);
         errdefer merged_table.deinit();
 
-        // 收集当前级别和下一级别的所有条目
         var all_entries = std.ArrayList(SSTable.Entry).init(self.allocator);
-        defer {
-            // 清理所有条目的内存
-            for (all_entries.items) |entry| {
-                self.allocator.free(entry.key);
-                self.allocator.free(entry.value);
-            }
-            all_entries.deinit();
-        }
+        errdefer all_entries.deinit();
 
-        // 读取当前级别的条目
-        var current_level_entries: usize = 0;
         for (self.levels[level].items) |table| {
             var entries = try table.readAllEntries();
-            defer {
-                for (entries.items) |entry| {
-                    self.allocator.free(entry.key);
-                    self.allocator.free(entry.value);
-                }
-                entries.deinit();
-            }
-            current_level_entries += entries.items.len;
+            defer entries.deinit();
             for (entries.items) |entry| {
-                try all_entries.append(.{ .key = try self.allocator.dupe(u8, entry.key), .value = try self.allocator.dupe(u8, entry.value), .timestamp = entry.timestamp });
+                try all_entries.append(.{
+                    .key = try self.allocator.dupe(u8, entry.key),
+                    .value = try self.allocator.dupe(u8, entry.value),
+                    .timestamp = entry.timestamp,
+                });
             }
         }
 
-        // 读取下一级别的条目
-        var next_level_entries: usize = 0;
         for (self.levels[next_level].items) |table| {
             var entries = try table.readAllEntries();
-            defer {
-                for (entries.items) |entry| {
-                    self.allocator.free(entry.key);
-                    self.allocator.free(entry.value);
-                }
-                entries.deinit();
-            }
-            next_level_entries += entries.items.len;
+            defer entries.deinit();
             for (entries.items) |entry| {
-                try all_entries.append(.{ .key = try self.allocator.dupe(u8, entry.key), .value = try self.allocator.dupe(u8, entry.value), .timestamp = entry.timestamp });
+                try all_entries.append(.{
+                    .key = try self.allocator.dupe(u8, entry.key),
+                    .value = try self.allocator.dupe(u8, entry.value),
+                    .timestamp = entry.timestamp,
+                });
             }
         }
 
-        // 按键和时间戳排序条目
         std.sort.block(SSTable.Entry, all_entries.items, {}, struct {
             pub fn lessThan(_: void, a: SSTable.Entry, b: SSTable.Entry) bool {
                 const key_cmp = std.mem.order(u8, a.key, b.key);
                 if (key_cmp == .eq) {
-                    return a.timestamp > b.timestamp; // 更新的条目优先
+                    return a.timestamp > b.timestamp;
                 }
                 return key_cmp == .lt;
             }
         }.lessThan);
 
-        // 写入合并后的条目到新的SSTable
-        try merged_table.write(all_entries.items);
+        // Deduplicate while keeping the newest version.
+        var deduped = std.ArrayList(SSTable.Entry).init(self.allocator);
+        defer deduped.deinit();
+        if (all_entries.items.len > 0) {
+            var prev_key = all_entries.items[0].key;
+            try deduped.append(.{
+                .key = try self.allocator.dupe(u8, all_entries.items[0].key),
+                .value = try self.allocator.dupe(u8, all_entries.items[0].value),
+                .timestamp = all_entries.items[0].timestamp,
+            });
+            for (all_entries.items[1..]) |entry| {
+                if (!std.mem.eql(u8, entry.key, prev_key)) {
+                    try deduped.append(.{
+                        .key = try self.allocator.dupe(u8, entry.key),
+                        .value = try self.allocator.dupe(u8, entry.value),
+                        .timestamp = entry.timestamp,
+                    });
+                    prev_key = entry.key;
+                }
+            }
+        }
 
-        // 更新级别信息
+        try merged_table.write(deduped.items);
         try self.levels[next_level].append(merged_table);
 
-        // 更新level_sizes - 使用实际条目数
-        self.level_sizes[next_level] = all_entries.items.len;
+        // Release duplicate entries and merged SSTable copies.
+        for (all_entries.items) |entry| {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value);
+        }
 
-        // 清理当前级别的旧表
         for (self.levels[level].items) |table| {
             table.deinit();
         }
-        try self.levels[level].resize(0);
+        self.levels[level].clearRetainingCapacity();
         self.level_sizes[level] = 0;
-
+        self.level_sizes[next_level] = deduped.items.len;
         self.sstable_counter += 1;
-
-        // 打印调试信息
-        std.debug.print("合并完成: level_sizes[{}] = {}, level_sizes[{}] = {}\n", .{ level, self.level_sizes[level], next_level, self.level_sizes[next_level] });
     }
 
+    /// Force compaction starting from a specific level.
     pub fn forceCompaction(self: *Self, level: usize) !void {
         if (level >= MAX_LEVEL - 1) {
-            std.debug.print("无法压缩最后一级\n", .{});
             return;
         }
 
-        // 如果内存表有数据，先刷新到level 0
         if (self.memtable.size > 0) {
-            std.debug.print("刷新内存表到level 0\n", .{});
             try self.flushMemTable();
         }
 
-        // 如果当前级别没有数据，无法压缩
         if (self.levels[level].items.len == 0) {
-            std.debug.print("level {} 没有数据，无法压缩\n", .{level});
             return;
         }
 
-        std.debug.print("强制压缩 level {} -> level {}\n", .{ level, level + 1 });
-
-        // 直接调用mergeLevel强制压缩
         try self.mergeLevel(level);
+    }
 
-        // 确保压缩后level_sizes正确更新
-        std.debug.print("强制压缩完成: level_sizes[{}] = {}, level_sizes[{}] = {}\n", .{ level, self.level_sizes[level], level + 1, self.level_sizes[level + 1] });
+    /// Compute the compaction threshold for a given level.
+    fn levelThreshold(level: usize) usize {
+        return std.math.pow(usize, LEVEL_SIZE_MULTIPLIER, level + 1);
     }
 };
 
@@ -265,9 +266,11 @@ test "LSMTree basic operations" {
     try lsm.put("key2", "value2");
 
     const value1 = try lsm.get("key1");
+    defer if (value1) |v| allocator.free(v);
     try std.testing.expect(std.mem.eql(u8, value1.?, "value1"));
 
     const value2 = try lsm.get("key2");
+    defer if (value2) |v| allocator.free(v);
     try std.testing.expect(std.mem.eql(u8, value2.?, "value2"));
 
     const non_existent = try lsm.get("key3");

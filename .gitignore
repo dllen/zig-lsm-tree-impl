@@ -1,29 +1,5 @@
-# Zig build artifacts
-zig-out/
-zig-cache/
 .zig-cache/
-
-# Executables
-/lsm
-
-# Dependencies
-/.direnv/
-
-# Editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS specific files
-.DS_Store
-.DS_Store?
-Thumbs.db
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Desktop.ini
-
+.zig-out/
 *.db
+test_sstable
+.DS_Store
